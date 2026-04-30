@@ -19,6 +19,7 @@ A simple yet powerful Python-based port scanner built using socket programming a
 ## ▶️ How to Run
 ```bash
 python port_scanner.py
+```
 
 ## ⚙️ How It Works
 
