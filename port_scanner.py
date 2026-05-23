@@ -2,6 +2,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 
 class PortScanner:
@@ -19,6 +20,17 @@ class PortScanner:
         3389: "RDP",
         5432: "PostgreSQL",
         8080: "HTTP-Proxy"
+    }
+
+    UDP_COMMON_PORTS = {
+        53: "DNS",
+        67: "DHCP",
+        69: "TFTP",
+        123: "NTP",
+        161: "SNMP",
+        162: "SNMP-Trap",
+        514: "Syslog",
+        520: "RIP"
     }
 
     def __init__(self, timeout=1):
@@ -92,18 +104,26 @@ class PortScanner:
             return
 
         service = self.COMMON_PORTS.get(port, "Unknown")
+        start_time = time.time()
         result = self.scan_port(target, port)
+        elapsed = time.time() - start_time
 
         if result == 0:
             banner = self.grab_banner(target, port)
             if banner:
-                print(f"[+] Port {port} ({service}) OPEN → {banner}")
+                line = f"[+] Port {port} ({service}) OPEN → {banner}"
             else:
-                print(f"[+] Port {port} ({service}) is OPEN")
+                line = f"[+] Port {port} ({service}) is OPEN"
+            stats = {"open": 1, "closed": 0, "error": 0, "total": 1}
         elif result is None:
-            print(f"[!] Error scanning port {port}")
+            line = f"[!] Error scanning port {port}"
+            stats = {"open": 0, "closed": 0, "error": 1, "total": 1}
         else:
-            print(f"[-] Port {port} ({service}) is CLOSED")
+            line = f"[-] Port {port} ({service}) is CLOSED"
+            stats = {"open": 0, "closed": 1, "error": 0, "total": 1}
+
+        print(line)
+        self.save_results([line], target, "TCP Single", stats, elapsed)
 
     def scan_range(self):
         target = input("Enter target (IP or domain): ")
@@ -124,34 +144,42 @@ class PortScanner:
         open_ports = 0
         closed_ports = 0
         error_ports = 0
+        output = []
 
         start_time = time.time()
 
         for port in range(start_port, end_port + 1):
             result = self.scan_port(target, port)
             service = self.COMMON_PORTS.get(port, "Unknown")
-            
 
             if result == 0:
                 banner = self.grab_banner(target, port)
                 if banner:
-                    print(f"[+] Port {port} ({service}) OPEN → {banner}")
+                    line = f"[+] Port {port} ({service}) OPEN → {banner}"
                 else:
-                    print(f"[+] Port {port} ({service}) is OPEN")
-                    open_ports += 1
+                    line = f"[+] Port {port} ({service}) is OPEN"
+                open_ports += 1
 
             elif result is None:
-                print(f"[!] Error scanning port {port}")
+                line = f"[!] Error scanning port {port}"
                 error_ports += 1
 
             else:
-                print(f"[-] Port {port} ({service}) is CLOSED")
+                line = f"[-] Port {port} ({service}) is CLOSED"
                 closed_ports += 1
 
+            print(line)
+            output.append(line)
+
         end_time = time.time()
+        elapsed = end_time - start_time
 
         self.report_summary(start_port, end_port, open_ports, closed_ports, error_ports)
-        print(f"\nScan completed in {end_time - start_time:.2f} seconds")
+        print(f"\nScan completed in {elapsed:.2f} seconds")
+
+        stats = {"open": open_ports, "closed": closed_ports, "error": error_ports,
+                 "total": end_port - start_port + 1}
+        self.save_results(output, target, "TCP Range", stats, elapsed)
 
 
     def scan_worker(self, target, port, results, output, lock):
@@ -195,37 +223,134 @@ class PortScanner:
         
         lock = threading.Lock()
         results = {"open": 0, "closed": 0, "error": 0}
-        threads = []
         output = []
 
         start_time = time.time()
-
-        # for port in range(start_port, end_port + 1):
-        #     t = threading.Thread(target=self.scan_worker, args=(target, port, results))
-        #     threads.append(t)
-        #     t.start()
 
         with ThreadPoolExecutor(max_workers=5) as executor:
             for port in range(start_port, end_port + 1):
                 executor.submit(self.scan_worker, target, port, results, output, lock)
 
-        # wait for all threads to finish
-        for t in threads:
-            t.join()
-        
         end_time = time.time()
+        elapsed = end_time - start_time
 
-        for line in output:
+        for line in sorted(output):
             print(line)
 
         self.report_summary(start_port, end_port,
                             results["open"],
                             results["closed"],
                             results["error"])
-        
-        print(f"\nScan completed in {end_time - start_time:.2f} seconds with Threading")
+
+        print(f"\nScan completed in {elapsed:.2f} seconds with Threading")
+
+        stats = {"open": results["open"], "closed": results["closed"],
+                 "error": results["error"], "total": end_port - start_port + 1}
+        self.save_results(sorted(output), target, "TCP Range (Threaded)", stats, elapsed)
 
 
+
+    # UDP Scan
+    def scan_udp_port(self, target, port):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(self.timeout)
+            sock.sendto(b"", (target, port))
+            sock.recvfrom(1024)
+            sock.close()
+            return "open"
+        except socket.timeout:
+            return "open|filtered"
+        except ConnectionRefusedError:
+            return "closed"
+        except socket.error:
+            return "closed"
+
+    def scan_udp_range(self):
+        target = input("Enter target (IP or domain): ")
+
+        if not self.validate_target(target):
+            return
+
+        try:
+            start_port = int(input("Enter start port: "))
+            end_port = int(input("Enter end port: "))
+        except ValueError:
+            print("[!] Invalid input")
+            return
+
+        if not self.validate_port_range(start_port, end_port):
+            return
+
+        open_ports = 0
+        open_filtered_ports = 0
+        closed_ports = 0
+        output = []
+
+        start_time = time.time()
+
+        for port in range(start_port, end_port + 1):
+            status = self.scan_udp_port(target, port)
+            service = self.UDP_COMMON_PORTS.get(port, "Unknown")
+
+            if status == "open":
+                line = f"[+] Port {port}/UDP ({service}) OPEN"
+                open_ports += 1
+            elif status == "open|filtered":
+                line = f"[~] Port {port}/UDP ({service}) OPEN|FILTERED"
+                open_filtered_ports += 1
+            else:
+                line = f"[-] Port {port}/UDP ({service}) CLOSED"
+                closed_ports += 1
+
+            print(line)
+            output.append(line)
+
+        end_time = time.time()
+        elapsed = end_time - start_time
+
+        print("\n--- UDP Scan Summary ---")
+        print(f"Total ports scanned: {end_port - start_port + 1}")
+        print(f"Open: {open_ports}")
+        print(f"Open|Filtered: {open_filtered_ports}")
+        print(f"Closed: {closed_ports}")
+        print(f"\nScan completed in {elapsed:.2f} seconds")
+
+        stats = {"open": open_ports, "open_filtered": open_filtered_ports,
+                 "closed": closed_ports, "error": 0,
+                 "total": end_port - start_port + 1}
+        self.save_results(output, target, "UDP Range", stats, elapsed)
+
+    # Save Results
+    def save_results(self, output_lines, target, scan_type, stats, elapsed):
+        choice = input("\nSave results to file? (y/n): ").strip().lower()
+        if choice != "y":
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_target = target.replace(".", "_").replace(":", "_")
+        filename = f"scan_{safe_target}_{timestamp}.txt"
+
+        with open(filename, "w") as f:
+            f.write("Port Scan Results\n")
+            f.write("=================\n")
+            f.write(f"Target   : {target}\n")
+            f.write(f"Scan type: {scan_type}\n")
+            f.write(f"Date     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("-" * 40 + "\n")
+            for line in output_lines:
+                f.write(line + "\n")
+            f.write("-" * 40 + "\n")
+            f.write(f"Total ports scanned: {stats['total']}\n")
+            if "open_filtered" in stats:
+                f.write(f"Open: {stats['open']} | Open|Filtered: {stats['open_filtered']} | "
+                        f"Closed: {stats['closed']}\n")
+            else:
+                f.write(f"Open: {stats['open']} | Closed: {stats['closed']} | "
+                        f"Errors: {stats['error']}\n")
+            f.write(f"Elapsed: {elapsed:.2f} seconds\n")
+
+        print(f"[+] Results saved to {filename}")
 
     # Reporting
     def report_summary(self, start, end, open_ports, closed_ports, error_ports):
@@ -243,24 +368,23 @@ class PortScanner:
             print("\n===== PORT SCANNER =====")
             print("1. Scan single port")
             print("2. Scan port range")
-            print("3. Scan port range(Threading)")
-            print("4. Exit")
+            print("3. Scan port range (Threading)")
+            print("4. Scan UDP port range")
+            print("5. Exit")
 
             choice = input("Select option: ")
 
             if choice == "1":
                 self.scan_single()
-
             elif choice == "2":
                 self.scan_range()
-                
             elif choice == "3":
-                    self.scan_range_thread()
-
+                self.scan_range_thread()
             elif choice == "4":
+                self.scan_udp_range()
+            elif choice == "5":
                 print("Exiting...")
                 break
-
             else:
                 print("[!] Invalid choice")
 
